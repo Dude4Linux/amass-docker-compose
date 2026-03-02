@@ -137,6 +137,45 @@ services:
         condition: service_completed_successfully
     entrypoint: /bin/track
 
+  mcp:
+    build: ./mcp
+    container_name: mcp
+    profiles: ["mcp"]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    logging: *default-logging
+    networks:
+      - amass
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - .:/workspace:ro
+    environment:
+      - HOST_PROJECT_DIR=${PROJECT_DIR}
+    expose:
+      - "8080"
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+          pids: 100
+        reservations:
+          memory: 128M
+    depends_on:
+      engine:
+        condition: service_healthy
+      syslog:
+        condition: service_healthy
+      config-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; s=socket.socket(); s.settimeout(3); s.connect(('localhost',8080)); s.close()"]
+      start_period: 15s
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
   arti:
     build: ./arti
     container_name: arti
