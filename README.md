@@ -125,6 +125,12 @@ docker compose exec arti /usr/local/bin/health-probe && echo healthy
 docker compose exec engine env | grep -i proxy
 ```
 
+**Verbose logging:** By default, arti and the HTTP proxy run quietly (warnings and errors only). To enable debug-level logging, add `DEBUG=1` to `.env` and restart:
+
+```bash
+docker compose up -d --no-deps arti
+```
+
 **Performance note:** Tor adds latency to every outbound request. Enumeration will be noticeably slower with Arti enabled.
 
 ### Tips

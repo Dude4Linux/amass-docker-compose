@@ -10,4 +10,4 @@ state_dir = "/var/lib/arti"
 port_info_file = "/var/lib/arti/port_info.json"
 
 [logging]
-console = "info"
+console = "${LOG_LEVEL}"

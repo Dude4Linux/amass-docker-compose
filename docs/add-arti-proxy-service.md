@@ -70,20 +70,38 @@ The `arti` service does **not** use `cap_add: [DAC_OVERRIDE]` (unlike the shared
 - `USER _arti` (no home directory, `/sbin/nologin`)
 - `allow_running_as_root = false` in `arti.toml`
 
+### tor-http-proxy security properties
+
+The `tor-http-proxy` binary went through a post-implementation security review. Key properties:
+
+- **Target validation** — `CONNECT` target must be a valid `host:port`; loopback addresses (`localhost`, `127.0.0.1`, `::1`) are rejected to prevent in-container SSRF
+- **Log injection prevention** — client-supplied strings (target, method) are sanitized before inclusion in log output; ASCII control characters are replaced with `?`
+- **Connection limit** — a `Semaphore(256)` caps concurrent in-flight connections; excess connections queue in the OS TCP backlog rather than spawning unbounded tasks
+- **Exact header buffer cap** — the `MAX_HEADER_BYTES` limit is enforced before each `extend_from_slice`, so the cap is exact rather than off by one read chunk
+- **RFC 7230 header parsing** — headers split on `\r\n` only, not bare `\n` or `\r`, per spec
+- **First-wins `Proxy-Authorization`** — duplicate headers are ignored after the first; last-wins would make circuit assignment harder to reason about
+- **Credential zeroing** — decoded credentials are held in `Zeroizing<String>` (via the `zeroize` crate) and zeroed on drop
+- **Reliable status-line read** — `health-probe` reads in a loop until `\r\n` is found, rather than relying on a single `read()` call returning a complete line
+
 ## Toggle Mechanism
 
-Single variable in `.env`:
+Two variables in `.env` control the arti service:
 
 ```
-# Arti (Tor) Proxy: uncomment the line below to route outbound traffic through Tor
+# Arti (Tor) Proxy: uncomment to route outbound traffic through Tor
 # COMPOSE_PROFILES=tor
+
+# Uncomment to enable verbose proxy logging (arti + tor-http-proxy)
+# DEBUG=1
 ```
 
-When enabled:
+When `COMPOSE_PROFILES=tor` is set:
 1. Docker Compose activates the `arti` service (profile: `tor`)
-2. `config-init.sh` detects `COMPOSE_PROFILES` contains "tor" and writes `config/proxy.env` with `ALL_PROXY`, `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY`
+2. `config-init.sh` detects `COMPOSE_PROFILES` contains "tor" (exact comma-delimited word match) and writes `config/proxy.env` with `ALL_PROXY`, `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY`
 3. The engine loads `proxy.env` via `env_file` with `required: false`
 4. When disabled, `config-init.sh` writes an empty `proxy.env`
+
+**Logging:** By default both `arti` and `tor-http-proxy` run quietly — arti at `warn` level, `tor-http-proxy` suppressing per-connection logs. Set `DEBUG=1` in `.env` to enable `debug`-level arti logging and per-connection `tor-http-proxy` output.
 
 ## Build Notes
 
@@ -100,21 +118,21 @@ The engine's raw DNS queries (via `miekg/dns` to ~50 public resolvers) are not i
 ## Files Created
 
 - **`arti/Dockerfile`** — multi-stage build: Arti + tor-http-proxy + health-probe
-- **`arti/docker/arti.toml`** — Arti config template; `SOCKS_PORT` substituted at startup
-- **`arti/docker/entrypoint.sh`** — validates ports, writes `/tmp/arti.toml`, traps SIGTERM, starts Arti and tor-http-proxy
-- **`arti/proxy/Cargo.toml`** — tor-http-proxy + health-probe crate definition
+- **`arti/docker/arti.toml`** — Arti config template; `SOCKS_PORT` and `LOG_LEVEL` substituted at startup
+- **`arti/docker/entrypoint.sh`** — validates ports, derives `LOG_LEVEL` from `DEBUG`, writes `/tmp/arti.toml`, traps SIGTERM, starts Arti and tor-http-proxy
+- **`arti/proxy/Cargo.toml`** — tor-http-proxy + health-probe crate (deps: tokio, tokio-socks, base64, zeroize)
 - **`arti/proxy/Cargo.lock`** — committed for reproducible `--locked` builds
-- **`arti/proxy/src/main.rs`** — tor-http-proxy: HTTP CONNECT → SOCKS5, Proxy-Authorization → circuit isolation, 30s header timeout, 255-byte credential limit
-- **`arti/proxy/src/bin/health-probe.rs`** — CONNECT healthcheck binary
+- **`arti/proxy/src/main.rs`** — tor-http-proxy: HTTP CONNECT → SOCKS5, Proxy-Authorization → circuit isolation, target validation, log sanitization, connection semaphore, RFC 7230 parsing, credential zeroing
+- **`arti/proxy/src/bin/health-probe.rs`** — CONNECT healthcheck binary; reads status line in a loop for TCP correctness
 - **`docs/add-arti-proxy-service.md`** — this file
 
 ## Files Modified
 
-- **`.env.template`** — Added commented `COMPOSE_PROFILES=tor` toggle
+- **`.env.template`** — Added `COMPOSE_PROFILES=tor` and `DEBUG=1` toggles (commented)
 - **`.gitignore`** — Added `config/proxy.env` (generated at runtime)
-- **`compose.yaml`** — Added `arti` service with `profiles: ["tor"]`; engine loads optional `proxy.env`; `arti-cache` and `arti-state` volumes declared
-- **`config/config-init.sh`** — Generates `proxy.env` pointing at `arti:9150` (SOCKS5) and `arti:8118` (HTTP); `NO_PROXY` includes all internal service names
-- **`README.md`** — Added "Arti Proxy" section
+- **`compose.yaml`** — Added `arti` service with `profiles: ["tor"]`; engine loads optional `proxy.env`; `arti-cache` and `arti-state` volumes declared; `DEBUG` env var passed to arti
+- **`config/config-init.sh`** — Generates `proxy.env` pointing at `arti:9150` (SOCKS5) and `arti:8118` (HTTP); `NO_PROXY` includes all internal service names; `COMPOSE_PROFILES` matched as exact comma-delimited word
+- **`README.md`** — Added "Arti Proxy" section with DEBUG logging note
 
 ## Verification Steps
 

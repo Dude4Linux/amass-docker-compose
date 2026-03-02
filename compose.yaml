@@ -152,6 +152,7 @@ services:
     environment:
       - SOCKS_PORT=9150
       - HTTP_PORT=8118
+      - DEBUG=${DEBUG:-}
     read_only: true
     tmpfs:
       - /tmp:size=10m,mode=1777

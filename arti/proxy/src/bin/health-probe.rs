@@ -64,11 +64,24 @@ async fn probe(http_port: u16) -> Result<(), Box<dyn std::error::Error>> {
     );
     stream.write_all(req.as_bytes()).await?;
 
-    // Read enough for the status line — "HTTP/1.1 200 Connection Established"
-    // is 39 bytes; a 64-byte buffer is sufficient.
-    let mut buf = [0u8; 64];
-    let n    = stream.read(&mut buf).await?;
-    let resp = std::str::from_utf8(&buf[..n]).unwrap_or("");
+    // Read until CRLF terminates the status line.  A single read() may
+    // return fewer bytes than needed; loop to guarantee a full line.
+    let mut buf = Vec::with_capacity(64);
+    let mut tmp = [0u8; 64];
+    loop {
+        let n = stream.read(&mut tmp).await?;
+        if n == 0 {
+            return Err("proxy closed connection before sending status line".into());
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if buf.windows(2).any(|w| w == b"\r\n") {
+            break;
+        }
+        if buf.len() > 128 {
+            return Err("status line exceeded 128 bytes".into());
+        }
+    }
+    let resp = std::str::from_utf8(&buf).map_err(|_| "non-UTF-8 in status line")?;
 
     if resp.starts_with("HTTP/1.1 200") || resp.starts_with("HTTP/1.0 200") {
         Ok(())

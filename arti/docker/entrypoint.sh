@@ -14,8 +14,17 @@ case "$HTTP_PORT" in
     *[!0-9]*|'') echo "ERROR: HTTP_PORT must be a positive integer (got '${HTTP_PORT}')"; exit 1 ;;
 esac
 
-# Write runtime config (substitutes SOCKS_PORT placeholder)
-sed "s|\${SOCKS_PORT}|${SOCKS_PORT}|g" /etc/arti/arti.toml > /tmp/arti.toml
+# Derive log level from DEBUG.  LOG_LEVEL is computed here (not taken from
+# the environment) so it is always a safe literal value for sed substitution.
+if [ -n "${DEBUG:-}" ]; then
+    LOG_LEVEL="debug"
+else
+    LOG_LEVEL="warn"
+fi
+
+# Write runtime config (substitutes SOCKS_PORT and LOG_LEVEL placeholders)
+sed "s|\${SOCKS_PORT}|${SOCKS_PORT}|g
+     s|\${LOG_LEVEL}|${LOG_LEVEL}|g" /etc/arti/arti.toml > /tmp/arti.toml
 chmod 0640 /tmp/arti.toml
 
 # Terminate both children and exit; used by the TERM/INT trap and the
@@ -37,7 +46,7 @@ trap 'cleanup 0' TERM INT
 ARTI_PID=$!
 
 # Start HTTP CONNECT proxy (forwards Proxy-Authorization creds to Arti SOCKS5)
-HTTP_PORT="${HTTP_PORT}" SOCKS_PORT="${SOCKS_PORT}" \
+HTTP_PORT="${HTTP_PORT}" SOCKS_PORT="${SOCKS_PORT}" DEBUG="${DEBUG:-}" \
     /usr/local/bin/tor-http-proxy &
 PROXY_PID=$!
 
