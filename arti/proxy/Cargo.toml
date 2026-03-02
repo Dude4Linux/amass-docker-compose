@@ -1,0 +1,13 @@
+[package]
+name = "tor-http-proxy"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "tor-http-proxy"
+path = "src/main.rs"
+
+[dependencies]
+tokio       = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macros", "time"] }
+tokio-socks = "0.5"
+base64      = "0.22"

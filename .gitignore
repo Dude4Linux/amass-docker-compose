@@ -1,6 +1,7 @@
-.env  
+.env
 config/config.yaml
 config/datasources.yaml
+config/proxy.env
 assetdb/*
 data/*
 logs/*

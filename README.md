@@ -95,6 +95,38 @@ docker compose run --rm viz -d example.com -dot -gexf -oA myresults
 
 If you set `DB_SERVER=neo4j` in `.env`, you can browse the graph database at [http://127.0.0.1:7474](http://127.0.0.1:7474). Log in with username `neo4j` and the `AMASS_PASSWORD` value from your `.env` file.
 
+### Arti Proxy (Optional)
+
+You can route outbound Amass traffic through the Tor network using [Arti](https://gitlab.torproject.org/tpo/core/arti) — Tor reimplemented in Rust — to anonymize your IP address when querying OSINT API providers (Shodan, VirusTotal, Censys, etc.).
+
+**Enable Arti:**
+
+1. Uncomment `COMPOSE_PROFILES=tor` in your `.env` file.
+2. Restart the stack: `docker compose up -d`
+
+The `arti` service will start automatically and the engine will route outbound HTTP/HTTPS requests through Tor.
+
+**What is anonymized:**
+
+- HTTPS requests to OSINT data source APIs (via `HTTP_PROXY` / `ALL_PROXY`)
+- Internal traffic between Amass services is **not** proxied (`NO_PROXY`)
+- Raw DNS queries from the Amass engine service are **not** proxied — the engine resolves DNS via `miekg/dns`, sending raw UDP to ~50 hardcoded public resolvers (Google, Cloudflare, Quad9, etc.). HTTP proxies cannot intercept these packets.
+
+**Verify Arti is working:**
+
+```bash
+# Check arti is healthy
+docker compose ps arti
+
+# Confirm traffic exits through Tor
+docker compose exec arti /usr/local/bin/health-probe && echo healthy
+
+# Confirm proxy env vars are set on the engine
+docker compose exec engine env | grep -i proxy
+```
+
+**Performance note:** Tor adds latency to every outbound request. Enumeration will be noticeably slower with Arti enabled.
+
 ### Tips
 
 You can create a shell function to run Amass commands from any directory without typing the full `docker compose run --rm` prefix.

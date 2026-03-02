@@ -1,0 +1,13 @@
+[application]
+allow_running_as_root = false
+
+[proxy]
+socks_listen = "0.0.0.0:${SOCKS_PORT}"
+
+[storage]
+cache_dir = "/var/cache/arti"
+state_dir = "/var/lib/arti"
+port_info_file = "/var/lib/arti/port_info.json"
+
+[logging]
+console = "info"
