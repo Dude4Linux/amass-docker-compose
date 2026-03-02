@@ -1,0 +1,23 @@
+{
+    admin 127.0.0.1:2019
+}
+
+{$DOMAIN} {
+    reverse_proxy mcp:8080 {
+        flush_interval -1
+        header_up X-Real-IP     {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+    }
+
+    rate_limit {
+        zone mcp_api {
+            key    {remote_host}
+            events 60
+            window 1m
+        }
+    }
+
+    log {
+        level INFO
+    }
+}
