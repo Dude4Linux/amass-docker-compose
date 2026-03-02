@@ -1,0 +1,83 @@
+name: Test MCP Server
+
+# Requires a self-hosted runner with:
+#   - Docker Engine + Compose plugin
+#   - ≥8GB RAM (neo4j: 2GB, postal: 2GB, engine: 1GB, others)
+#   - Outbound internet access (scan tests hit owasp.org)
+
+on:
+  push:
+    branches:
+      - add-mcp-server
+      - main
+    paths:
+      - "mcp/**"
+      - "compose.yaml"
+      - ".github/workflows/test-mcp.yml"
+  pull_request:
+    paths:
+      - "mcp/**"
+      - "compose.yaml"
+      - ".github/workflows/test-mcp.yml"
+
+jobs:
+  test-mcp:
+    name: MCP Integration Tests
+    runs-on: self-hosted
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create .env for CI
+        run: |
+          cp .env.template .env
+          # Inject CI credentials (non-default values to catch hardcoded strings)
+          sed -i 's|postgres # Change Me!|postgres-ci-${{ github.run_id }}|' .env
+          sed -i 's|amass4OWASP # Change Me!|amassCI-${{ github.run_id }}|' .env
+          echo "COMPOSE_PROFILES=mcp" >> .env
+          echo "PROJECT_DIR=${{ github.workspace }}" >> .env
+
+      - name: Build MCP image
+        run: docker compose build mcp
+
+      - name: Start stack
+        run: docker compose up -d
+        timeout-minutes: 5
+
+      - name: Wait for all services healthy
+        run: |
+          echo "Waiting for stack to become healthy..."
+          timeout 180 bash -c '
+            until docker compose ps --format "{{.Name}} {{.Status}}" \
+              | grep -v "^$" \
+              | grep -v "(healthy)" \
+              | grep -v "Exit 0" \
+              | grep -qv "mcp"; do
+              echo "  still waiting..."
+              sleep 10
+            done
+          '
+          docker compose ps
+
+      - name: Run MCP tool tests
+        run: |
+          docker compose exec -T mcp \
+            python3 -m pytest tests/ -v --tb=short
+        env:
+          COMPOSE_PROJECT_NAME: amass
+
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          echo "=== compose ps ==="
+          docker compose ps
+          echo "=== mcp logs ==="
+          docker compose logs --tail=50 mcp
+          echo "=== engine logs ==="
+          docker compose logs --tail=30 engine
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v --remove-orphans

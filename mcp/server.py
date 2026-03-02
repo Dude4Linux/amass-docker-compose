@@ -12,10 +12,12 @@ Ephemeral scan jobs (run/status/stop):
   enum, viz, subs, assoc, track
 """
 
+import glob
 import logging
 import os
 import re
 import subprocess
+import uuid
 from typing import Optional
 
 import docker
@@ -25,14 +27,18 @@ from mcp.server.fastmcp import FastMCP
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-# Path to compose file inside this container (mounted read-only from host)
-COMPOSE_FILE = "/workspace/compose.yaml"
-# Host-side project directory — required for docker compose run (volume path resolution)
+# Host-side project directory — mounted at the same path inside this container.
+# Required for all docker compose subcommands (file discovery + volume path resolution).
 PROJECT_DIR = os.environ.get("HOST_PROJECT_DIR", "")
+COMPOSE_FILE = os.path.join(PROJECT_DIR, "compose.yaml") if PROJECT_DIR else ""
 
 CONTINUOUS_SERVICES = ["engine", "assetdb", "neo4j", "postal", "syslog"]
 OPTIONAL_SERVICES = ["arti"]
 SCAN_SERVICES = ["enum", "viz", "subs", "assoc", "track"]
+
+# Services that forward stdout to syslog-ng — container.logs() returns empty for these.
+# Their logs are in {PROJECT_DIR}/logs/amass/{service}/{date}-amass-{service}.log
+SYSLOG_SERVICES = {"engine", "postal", "enum", "viz", "subs", "assoc", "track"}
 
 mcp = FastMCP(
     "amass-control",
@@ -92,6 +98,29 @@ def _compose(subcmd: list[str], timeout: int = 60) -> tuple[int, str, str]:
         return 1, "", f"docker compose timed out after {timeout}s"
     except FileNotFoundError:
         return 1, "", "docker CLI not found in PATH"
+
+
+def _syslog_logs(service: str, lines: int) -> str:
+    """Read the most recent syslog-ng log file(s) for services that don't write to stdout."""
+    if not PROJECT_DIR:
+        return f"(HOST_PROJECT_DIR not set — cannot locate syslog files for {service})"
+    log_dir = os.path.join(PROJECT_DIR, "logs", "amass", service)
+    if not os.path.isdir(log_dir):
+        return f"(syslog log directory not found: {log_dir})"
+    log_files = sorted(glob.glob(os.path.join(log_dir, "*.log")))
+    if not log_files:
+        return f"(no log files in {log_dir})"
+    # Collect lines from most recent files until we have enough
+    collected: list[str] = []
+    for path in reversed(log_files):
+        try:
+            with open(path, errors="replace") as f:
+                collected = f.readlines() + collected
+        except OSError:
+            continue
+        if len(collected) >= lines:
+            break
+    return "".join(collected[-lines:]) if collected else f"(no log content for {service})"
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +252,9 @@ def service_logs(service: str, lines: int = 50) -> str:
     if service not in all_services:
         return f"Error: Unknown service '{service}'. Known: {all_services}"
 
+    if service in SYSLOG_SERVICES:
+        return _syslog_logs(service, min(lines, 500))
+
     container = _get_container(service)
     if container is None:
         return f"{service} container not found"
@@ -238,6 +270,21 @@ def service_logs(service: str, lines: int = 50) -> str:
 # Scan job tools
 # ---------------------------------------------------------------------------
 
+def _load_env_file(path: str) -> dict[str, str]:
+    """Parse a simple KEY=VALUE env file into a dict."""
+    env: dict[str, str] = {}
+    try:
+        with open(path, errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    env[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return env
+
+
 @mcp.tool()
 def scan_run(domain: str, alts: bool = False) -> str:
     """
@@ -251,21 +298,54 @@ def scan_run(domain: str, alts: bool = False) -> str:
     """
     if not _DOMAIN_RE.match(domain):
         return f"Error: Invalid domain name: {domain!r}"
+    if docker_client is None:
+        return "Error: Docker not available"
+    if not PROJECT_DIR:
+        return "Error: HOST_PROJECT_DIR is not set — cannot locate volumes or image"
 
-    # Build: docker compose run -d --rm enum [-alts] -d <domain>
-    # Note: first -d is compose detach flag; second -d is enum's domain flag
-    cmd = ["run", "-d", "--rm", "enum"]
+    # Discover the image from the running engine container's project label
+    engine = _get_container("engine")
+    if engine is None:
+        return "Error: engine container not found — is the stack running?"
+    project = engine.labels.get("com.docker.compose.project", "amass")
+    image = f"{project}-enum:latest"
+
+    # Load syslog environment (same as compose env_file)
+    env = _load_env_file(os.path.join(PROJECT_DIR, "config", "logs", "syslog.env"))
+
+    # Ensure output directory exists
+    data_dir = os.path.join(PROJECT_DIR, "data", "enum")
+    os.makedirs(data_dir, exist_ok=True)
+
+    # Replicate enum service config from compose.yaml
+    command = []
     if alts:
-        cmd.append("-alts")
-    cmd += ["-d", domain]
+        command.append("-alts")
+    command += ["-d", domain]
 
-    rc, stdout, stderr = _compose(cmd)
-    if rc != 0:
-        return f"Failed to start scan for {domain}: {stderr}"
-
-    container_id = stdout.strip()
-    label = container_id[:12] if container_id else "unknown"
-    return f"Scan started: enum -d {domain}{' -alts' if alts else ''} (container: {label})"
+    try:
+        container = docker_client.containers.run(
+            image,
+            command=command,
+            entrypoint="/bin/enum",
+            network="amass-net",
+            volumes={
+                os.path.join(PROJECT_DIR, "config"): {"bind": "/.config/amass", "mode": "rw"},
+                data_dir: {"bind": "/data", "mode": "rw"},
+            },
+            environment=env,
+            cap_drop=["ALL"],
+            cap_add=["DAC_OVERRIDE"],
+            security_opt=["no-new-privileges:true"],
+            mem_limit="512m",
+            pids_limit=100,
+            name=f"amass-enum-{domain.replace('.', '-')}-{uuid.uuid4().hex[:6]}",
+            detach=True,
+            auto_remove=True,
+        )
+        return f"Scan started: enum -d {domain}{' -alts' if alts else ''} (container: {container.short_id})"
+    except APIError as exc:
+        return f"Failed to start scan for {domain}: {exc}"
 
 
 @mcp.tool()
@@ -320,7 +400,7 @@ def scan_stop(scan_type: str = "enum") -> str:
 if __name__ == "__main__":
     if not PROJECT_DIR:
         logger.warning(
-            "HOST_PROJECT_DIR is not set. Service start (when container is missing) "
-            "and scan_run will not work. Set it in .env."
+            "HOST_PROJECT_DIR is not set. scan_run, service_logs (syslog services), "
+            "and cold-start of services will not work. Set PROJECT_DIR in .env."
         )
     mcp.run(transport="sse")

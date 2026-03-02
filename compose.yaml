@@ -148,7 +148,7 @@ services:
       - amass
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - .:/workspace:ro
+      - ${PROJECT_DIR}:${PROJECT_DIR}:ro
     environment:
       - HOST_PROJECT_DIR=${PROJECT_DIR}
     expose:
