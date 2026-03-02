@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from server import (
     CONTINUOUS_SERVICES,
+    MAX_CONCURRENT_SCANS,
     OPTIONAL_SERVICES,
     SCAN_SERVICES,
     docker_client,
@@ -245,3 +246,31 @@ class TestScanStop:
     def test_stop_unknown_scan_type_returns_error(self):
         result = scan_stop("nonexistent")
         assert "Error" in result
+
+
+# ---------------------------------------------------------------------------
+# Concurrent scan limit
+# ---------------------------------------------------------------------------
+
+class TestScanRunConcurrency:
+    def test_concurrent_limit_enforced(self, no_enum_running):
+        """scan_run should refuse when MAX_CONCURRENT_SCANS are already running."""
+        # Fill up to the limit with distinct domains
+        domains = [f"sub{i}.owasp.org" for i in range(MAX_CONCURRENT_SCANS)]
+        for d in domains:
+            result = scan_run(d)
+            # Each should start (or at least not fail on the limit)
+            if "Error: " in result and "scans already running" in result:
+                # Limit hit earlier than expected — still correct behaviour
+                break
+
+        time.sleep(1)
+        running_before = scan_status()["enum"]["running"]
+
+        # One more should be refused
+        extra = scan_run("extra.owasp.org")
+        assert "Error" in extra
+        assert "scans already running" in extra
+
+        # Running count must not have increased
+        assert scan_status()["enum"]["running"] == running_before

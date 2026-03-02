@@ -5,39 +5,62 @@ Amass MCP Control Server
 Exposes tools for managing Amass services and scan jobs via MCP/SSE.
 Remote agents connect through nginx (Phase 2); local use via docker compose exec.
 
+Authentication: set MCP_API_KEY in .env — all SSE requests must include
+  Authorization: Bearer <key>
+If MCP_API_KEY is unset the endpoint is open; a warning is logged at startup.
+
 Continuous services (start/stop/restart/status/logs):
   engine, assetdb, neo4j, postal, syslog, arti
 
 Ephemeral scan jobs (run/status/stop):
   enum, viz, subs, assoc, track
+
+Security notes:
+  - /var/run/docker.sock gives this container full Docker daemon access
+    (equivalent to host root). The :ro mount label has no effect on sockets.
+  - Only config/logs/ and logs/ subdirectories are mounted; .env and other
+    credential files are NOT accessible to this container.
+  - HOST_PROJECT_DIR is used only as a host-side path passed to docker-py
+    for scan container volume mounts; it is never read from the filesystem here.
 """
 
 import glob
 import logging
 import os
 import re
-import subprocess
+import secrets
 import uuid
 from typing import Optional
 
 import docker
+import uvicorn
 from docker.errors import APIError, NotFound
 from mcp.server.fastmcp import FastMCP
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-# Host-side project directory — mounted at the same path inside this container.
-# Required for all docker compose subcommands (file discovery + volume path resolution).
+# Host-side project path — used only as a host path passed to docker-py for
+# scan container volume mounts. Never accessed as a filesystem path here.
 PROJECT_DIR = os.environ.get("HOST_PROJECT_DIR", "")
-COMPOSE_FILE = os.path.join(PROJECT_DIR, "compose.yaml") if PROJECT_DIR else ""
+
+# API key for Bearer token authentication. Set MCP_API_KEY in .env.
+MCP_API_KEY = os.environ.get("MCP_API_KEY", "")
+
+# Fixed internal paths — only these subdirectories are mounted into this container.
+SYSLOG_ENV_FILE = "/config/logs/syslog.env"   # ${PROJECT_DIR}/config/logs → /config/logs
+LOG_BASE_DIR = "/logs/amass"                   # ${PROJECT_DIR}/logs → /logs
+
+MAX_CONCURRENT_SCANS = 5  # refuse scan_run if this many enum containers are already running
 
 CONTINUOUS_SERVICES = ["engine", "assetdb", "neo4j", "postal", "syslog"]
 OPTIONAL_SERVICES = ["arti"]
 SCAN_SERVICES = ["enum", "viz", "subs", "assoc", "track"]
 
 # Services that forward stdout to syslog-ng — container.logs() returns empty for these.
-# Their logs are in {PROJECT_DIR}/logs/amass/{service}/{date}-amass-{service}.log
+# Logs are in LOG_BASE_DIR/{service}/{date}-amass-{service}.log
 SYSLOG_SERVICES = {"engine", "postal", "enum", "viz", "subs", "assoc", "track"}
 
 mcp = FastMCP(
@@ -65,7 +88,27 @@ _DOMAIN_RE = re.compile(
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Auth middleware
+# ---------------------------------------------------------------------------
+
+class _BearerAuthMiddleware(BaseHTTPMiddleware):
+    """Require Authorization: Bearer <MCP_API_KEY> on all SSE requests."""
+
+    async def dispatch(self, request, call_next):
+        auth = request.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)
+        token = auth[7:]
+        if not secrets.compare_digest(
+            token.encode("utf-8"),
+            MCP_API_KEY.encode("utf-8"),
+        ):
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)
+        return await call_next(request)
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
 # ---------------------------------------------------------------------------
 
 def _get_container(name: str) -> Optional[docker.models.containers.Container]:
@@ -80,37 +123,14 @@ def _get_container(name: str) -> Optional[docker.models.containers.Container]:
         return None
 
 
-def _compose(subcmd: list[str], timeout: int = 60) -> tuple[int, str, str]:
-    """Run a docker compose subcommand against the host project. Returns (rc, stdout, stderr)."""
-    if not PROJECT_DIR:
-        return 1, "", "HOST_PROJECT_DIR is not set — cannot run docker compose commands"
-
-    cmd = [
-        "docker", "compose",
-        "-f", COMPOSE_FILE,
-        "--project-directory", PROJECT_DIR,
-    ] + subcmd
-
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return result.returncode, result.stdout.strip(), result.stderr.strip()
-    except subprocess.TimeoutExpired:
-        return 1, "", f"docker compose timed out after {timeout}s"
-    except FileNotFoundError:
-        return 1, "", "docker CLI not found in PATH"
-
-
 def _syslog_logs(service: str, lines: int) -> str:
     """Read the most recent syslog-ng log file(s) for services that don't write to stdout."""
-    if not PROJECT_DIR:
-        return f"(HOST_PROJECT_DIR not set — cannot locate syslog files for {service})"
-    log_dir = os.path.join(PROJECT_DIR, "logs", "amass", service)
+    log_dir = os.path.join(LOG_BASE_DIR, service)
     if not os.path.isdir(log_dir):
         return f"(syslog log directory not found: {log_dir})"
     log_files = sorted(glob.glob(os.path.join(log_dir, "*.log")))
     if not log_files:
         return f"(no log files in {log_dir})"
-    # Collect lines from most recent files until we have enough
     collected: list[str] = []
     for path in reversed(log_files):
         try:
@@ -121,6 +141,21 @@ def _syslog_logs(service: str, lines: int) -> str:
         if len(collected) >= lines:
             break
     return "".join(collected[-lines:]) if collected else f"(no log content for {service})"
+
+
+def _load_env_file(path: str) -> dict[str, str]:
+    """Parse a simple KEY=VALUE env file into a dict."""
+    env: dict[str, str] = {}
+    try:
+        with open(path, errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    env[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return env
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +199,9 @@ def service_status(service: Optional[str] = None) -> dict:
 @mcp.tool()
 def service_start(service: str) -> str:
     """
-    Start a continuous service and its dependencies.
+    Start a stopped service container.
+    The container must already exist (stack started with docker compose up at least once).
+    For initial provisioning use docker compose directly.
 
     Args:
         service: Service to start: engine, assetdb, neo4j, postal, syslog, arti
@@ -174,23 +211,21 @@ def service_start(service: str) -> str:
         return f"Error: '{service}' is not a managed service. Choose from: {managed}"
 
     container = _get_container(service)
+    if container is None:
+        return (
+            f"Error: {service} container not found. "
+            "Provision the stack with 'docker compose up -d' first."
+        )
 
-    if container is not None:
-        container.reload()
-        if container.status == "running":
-            return f"{service} is already running"
-        # Container exists but is stopped — restart it directly
-        try:
-            container.start()
-            return f"{service} started"
-        except APIError as exc:
-            return f"Failed to start {service}: {exc}"
+    container.reload()
+    if container.status == "running":
+        return f"{service} is already running"
 
-    # Container doesn't exist yet — let compose create it with correct config
-    rc, _, stderr = _compose(["up", "-d", service])
-    if rc != 0:
-        return f"Failed to start {service}: {stderr}"
-    return f"{service} started"
+    try:
+        container.start()
+        return f"{service} started"
+    except APIError as exc:
+        return f"Failed to start {service}: {exc}"
 
 
 @mcp.tool()
@@ -270,21 +305,6 @@ def service_logs(service: str, lines: int = 50) -> str:
 # Scan job tools
 # ---------------------------------------------------------------------------
 
-def _load_env_file(path: str) -> dict[str, str]:
-    """Parse a simple KEY=VALUE env file into a dict."""
-    env: dict[str, str] = {}
-    try:
-        with open(path, errors="replace") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    k, v = line.split("=", 1)
-                    env[k.strip()] = v.strip()
-    except OSError:
-        pass
-    return env
-
-
 @mcp.tool()
 def scan_run(domain: str, alts: bool = False) -> str:
     """
@@ -301,23 +321,26 @@ def scan_run(domain: str, alts: bool = False) -> str:
     if docker_client is None:
         return "Error: Docker not available"
     if not PROJECT_DIR:
-        return "Error: HOST_PROJECT_DIR is not set — cannot locate volumes or image"
+        return "Error: HOST_PROJECT_DIR is not set — cannot locate scan volumes or image"
 
-    # Discover the image from the running engine container's project label
+    # Enforce concurrent scan limit
+    running = docker_client.containers.list(filters={"name": "enum", "status": "running"})
+    if len(running) >= MAX_CONCURRENT_SCANS:
+        return (
+            f"Error: {MAX_CONCURRENT_SCANS} scans already running. "
+            "Stop some with scan_stop before starting more."
+        )
+
+    # Discover image from the running engine container's compose project label
     engine = _get_container("engine")
     if engine is None:
         return "Error: engine container not found — is the stack running?"
     project = engine.labels.get("com.docker.compose.project", "amass")
     image = f"{project}-enum:latest"
 
-    # Load syslog environment (same as compose env_file)
-    env = _load_env_file(os.path.join(PROJECT_DIR, "config", "logs", "syslog.env"))
+    # Load syslog environment (matches compose env_file for the enum service)
+    env = _load_env_file(SYSLOG_ENV_FILE)
 
-    # Ensure output directory exists
-    data_dir = os.path.join(PROJECT_DIR, "data", "enum")
-    os.makedirs(data_dir, exist_ok=True)
-
-    # Replicate enum service config from compose.yaml
     command = []
     if alts:
         command.append("-alts")
@@ -330,8 +353,8 @@ def scan_run(domain: str, alts: bool = False) -> str:
             entrypoint="/bin/enum",
             network="amass-net",
             volumes={
-                os.path.join(PROJECT_DIR, "config"): {"bind": "/.config/amass", "mode": "rw"},
-                data_dir: {"bind": "/data", "mode": "rw"},
+                f"{PROJECT_DIR}/config": {"bind": "/.config/amass", "mode": "rw"},
+                f"{PROJECT_DIR}/data/enum": {"bind": "/data", "mode": "rw"},
             },
             environment=env,
             cap_drop=["ALL"],
@@ -398,9 +421,22 @@ def scan_stop(scan_type: str = "enum") -> str:
 
 
 if __name__ == "__main__":
+    if not MCP_API_KEY:
+        logger.warning(
+            "MCP_API_KEY is not set — the SSE endpoint has no authentication. "
+            "Set MCP_API_KEY in .env before exposing this service externally."
+        )
+    else:
+        logger.info("API key authentication enabled")
+
     if not PROJECT_DIR:
         logger.warning(
-            "HOST_PROJECT_DIR is not set. scan_run, service_logs (syslog services), "
-            "and cold-start of services will not work. Set PROJECT_DIR in .env."
+            "HOST_PROJECT_DIR is not set — scan_run will not work. "
+            "Set PROJECT_DIR in .env."
         )
-    mcp.run(transport="sse")
+
+    app = mcp.sse_app()
+    if MCP_API_KEY:
+        app.add_middleware(_BearerAuthMiddleware)
+
+    uvicorn.run(app, host="0.0.0.0", port=8080)

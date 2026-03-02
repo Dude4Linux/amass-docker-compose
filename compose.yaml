@@ -147,10 +147,12 @@ services:
     networks:
       - amass
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ${PROJECT_DIR}:${PROJECT_DIR}:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${PROJECT_DIR}/config/logs:/config/logs:ro
+      - ${PROJECT_DIR}/logs:/logs:ro
     environment:
       - HOST_PROJECT_DIR=${PROJECT_DIR}
+      - MCP_API_KEY=${MCP_API_KEY:-}
     expose:
       - "8080"
     deploy:
