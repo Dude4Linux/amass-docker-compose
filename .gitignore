@@ -9,5 +9,6 @@ config/logs/log/
 config/logs/syslog-ng.ctl
 config/logs/syslog-ng.persist
 config/logs/syslog-ng.pid
+arti/proxy/target/
 .claude/*
 CLAUDE.md
